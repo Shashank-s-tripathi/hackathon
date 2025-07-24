@@ -1,0 +1,689 @@
+import React, { useState, useCallback } from 'react';
+import { useDropzone } from 'react-dropzone';
+import Papa from 'papaparse';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import jsPDF from 'jspdf';
+import html2canvas from 'html2canvas';
+import { UploadCloud, FileText, Settings, BarChart2, Download, HelpCircle, ArrowLeft, ArrowRight, CheckCircle, AlertCircle } from 'lucide-react';
+
+// Utility function for combining class names
+const cn = (...classes) => classes.filter(Boolean).join(' ');
+
+// --- UI Components (inspired by shadcn/ui) ---
+
+const Button = React.forwardRef(({ className, variant, size, ...props }, ref) => {
+  const baseClasses = "inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50";
+  const variants = {
+    default: "bg-blue-600 text-white hover:bg-blue-700",
+    destructive: "bg-red-500 text-white hover:bg-red-600",
+    outline: "border border-input bg-background hover:bg-accent hover:text-accent-foreground",
+    secondary: "bg-gray-200 text-gray-800 hover:bg-gray-300",
+    ghost: "hover:bg-accent hover:text-accent-foreground",
+    link: "text-primary underline-offset-4 hover:underline",
+  };
+  const sizes = {
+    default: "h-10 px-4 py-2",
+    sm: "h-9 rounded-md px-3",
+    lg: "h-11 rounded-md px-8",
+    icon: "h-10 w-10",
+  };
+  return <button className={cn(baseClasses, variants[variant || 'default'], sizes[size || 'default'], className)} ref={ref} {...props} />;
+});
+
+const Card = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("rounded-xl border bg-white text-card-foreground shadow-sm", className)} {...props} />
+));
+
+const CardHeader = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("flex flex-col space-y-1.5 p-6", className)} {...props} />
+));
+
+const CardTitle = React.forwardRef(({ className, ...props }, ref) => (
+  <h3 ref={ref} className={cn("text-2xl font-semibold leading-none tracking-tight", className)} {...props} />
+));
+
+const CardDescription = React.forwardRef(({ className, ...props }, ref) => (
+  <p ref={ref} className={cn("text-sm text-gray-500", className)} {...props} />
+));
+
+const CardContent = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("p-6 pt-0", className)} {...props} />
+));
+
+const CardFooter = React.forwardRef(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("flex items-center p-6 pt-0", className)} {...props} />
+));
+
+const Select = React.forwardRef(({ className, children, ...props }, ref) => (
+    <select ref={ref} className={cn("flex h-10 w-full items-center justify-between rounded-md border border-input bg-transparent px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50", className)} {...props}>
+        {children}
+    </select>
+));
+
+const Input = React.forwardRef(({ className, type, ...props }, ref) => (
+    <input type={type} className={cn("flex h-10 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50", className)} ref={ref} {...props} />
+));
+
+const Label = React.forwardRef(({ className, ...props }, ref) => (
+    <label ref={ref} className={cn("text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70", className)} {...props} />
+));
+
+const TooltipWrapper = ({ children, text }) => {
+    const [visible, setVisible] = useState(false);
+    return (
+        <div className="relative inline-flex items-center">
+            {children}
+            <div onMouseEnter={() => setVisible(true)} onMouseLeave={() => setVisible(false)} className="ml-2 cursor-pointer">
+                <HelpCircle className="h-4 w-4 text-gray-400" />
+            </div>
+            {visible && (
+                <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-max max-w-xs p-2 bg-gray-800 text-white text-xs rounded-md shadow-lg z-10">
+                    {text}
+                </div>
+            )}
+        </div>
+    );
+};
+
+// --- Core Data Processing Logic ---
+
+const dataProcessor = {
+    handleMissingValues: (data, column, method) => {
+        const colData = data.map(row => parseFloat(row[column])).filter(val => !isNaN(val));
+        if (colData.length === 0) return data;
+
+        let replacement;
+        if (method === 'mean') {
+            replacement = colData.reduce((a, b) => a + b, 0) / colData.length;
+        } else if (method === 'median') {
+            const sorted = [...colData].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            replacement = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        } else {
+            return data; // KNN is complex, returning original for now
+        }
+
+        return data.map(row => {
+            if (row[column] === null || row[column] === '' || isNaN(parseFloat(row[column]))) {
+                return { ...row, [column]: replacement.toFixed(2) };
+            }
+            return row;
+        });
+    },
+
+    detectOutliers: (data, column, method, threshold = 1.5) => {
+        const colData = data.map(row => parseFloat(row[column])).filter(val => !isNaN(val));
+        if (colData.length < 4) return data.map(row => ({ ...row, [`${column}_is_outlier`]: false }));
+
+        let lowerBound, upperBound;
+        if (method === 'iqr') {
+            const sorted = [...colData].sort((a, b) => a - b);
+            const q1 = sorted[Math.floor(sorted.length / 4)];
+            const q3 = sorted[Math.floor(sorted.length * 3 / 4)];
+            const iqr = q3 - q1;
+            lowerBound = q1 - threshold * iqr;
+            upperBound = q3 + threshold * iqr;
+        } else if (method === 'z-score') {
+            const mean = colData.reduce((a, b) => a + b, 0) / colData.length;
+            const stdDev = Math.sqrt(colData.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / colData.length);
+            lowerBound = mean - threshold * stdDev;
+            upperBound = mean + threshold * stdDev;
+        } else {
+            return data.map(row => ({ ...row, [`${column}_is_outlier`]: false }));
+        }
+
+        return data.map(row => {
+            const val = parseFloat(row[column]);
+            const isOutlier = !isNaN(val) && (val < lowerBound || val > upperBound);
+            return { ...row, [`${column}_is_outlier`]: isOutlier };
+        });
+    },
+
+    calculateEstimates: (data, variable, weight) => {
+        const validData = data.filter(row => row[variable] != null && !isNaN(parseFloat(row[variable])));
+        
+        // Unweighted
+        const n = validData.length;
+        const unweightedSum = validData.reduce((sum, row) => sum + parseFloat(row[variable]), 0);
+        const unweightedMean = n > 0 ? unweightedSum / n : 0;
+        const unweightedVar = n > 0 ? validData.reduce((sum, row) => sum + Math.pow(parseFloat(row[variable]) - unweightedMean, 2), 0) / (n - 1) : 0;
+        const unweightedSE = n > 0 ? Math.sqrt(unweightedVar / n) : 0;
+        const unweightedMoE = 1.96 * unweightedSE;
+
+        // Weighted
+        const weightedData = validData.filter(row => row[weight] != null && !isNaN(parseFloat(row[weight])));
+        const sumOfWeights = weightedData.reduce((sum, row) => sum + parseFloat(row[weight]), 0);
+        const weightedSum = weightedData.reduce((sum, row) => sum + parseFloat(row[variable]) * parseFloat(row[weight]), 0);
+        const weightedMean = sumOfWeights > 0 ? weightedSum / sumOfWeights : 0;
+        
+        // Simplified weighted SE - proper calculation is complex and depends on survey design
+        const weightedVar = sumOfWeights > 0 ? weightedData.reduce((sum, row) => sum + parseFloat(row[weight]) * Math.pow(parseFloat(row[variable]) - weightedMean, 2), 0) / sumOfWeights : 0;
+        const weightedSE = sumOfWeights > 0 ? Math.sqrt(weightedVar / weightedData.length) : 0; // Simplified
+        const weightedMoE = 1.96 * weightedSE;
+        
+        return {
+            unweighted: { count: n, mean: unweightedMean, moe: unweightedMoE, total: unweightedSum },
+            weighted: { count: weightedData.length, mean: weightedMean, moe: weightedMoE, total: weightedSum }
+        };
+    }
+};
+
+
+// --- Wizard Steps ---
+
+const Step1_Upload = ({ onFileAccepted }) => {
+    const onDrop = useCallback(acceptedFiles => {
+        const file = acceptedFiles[0];
+        if (file) {
+            Papa.parse(file, {
+                header: true,
+                skipEmptyLines: true,
+                complete: (results) => {
+                    onFileAccepted(file.name, results.data, results.meta.fields);
+                }
+            });
+        }
+    }, [onFileAccepted]);
+
+    const { getRootProps, getInputProps, isDragActive } = useDropzone({
+        onDrop,
+        accept: { 'text/csv': ['.csv'], 'application/vnd.ms-excel': ['.xls', '.xlsx'] }
+    });
+
+    return (
+        <Card>
+            <CardHeader>
+                <CardTitle>Step 1: Upload Survey Data</CardTitle>
+                <CardDescription>Drag and drop your CSV or Excel file here, or click to select a file.</CardDescription>
+            </CardHeader>
+            <CardContent>
+                <div {...getRootProps()} className={`flex flex-col items-center justify-center p-12 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${isDragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-blue-400'}`}>
+                    <input {...getInputProps()} />
+                    <UploadCloud className="w-12 h-12 text-gray-400 mb-4" />
+                    {isDragActive ? (
+                        <p className="text-lg text-blue-600 font-semibold">Drop the file here...</p>
+                    ) : (
+                        <p className="text-lg text-gray-600">Drag & drop a file, or <span className="text-blue-600 font-semibold">browse</span></p>
+                    )}
+                    <p className="text-sm text-gray-500 mt-2">Supported formats: CSV, XLS, XLSX</p>
+                </div>
+            </CardContent>
+        </Card>
+    );
+};
+
+const Step2_SchemaMapping = ({ columns, schemaMapping, setSchemaMapping }) => {
+    const targetFields = ['uniqueId', 'strata', 'weight', 'analysisVar1', 'analysisVar2'];
+
+    const handleMappingChange = (target, source) => {
+        setSchemaMapping(prev => ({ ...prev, [target]: source }));
+    };
+
+    return (
+        <Card>
+            <CardHeader>
+                <CardTitle>Step 2: Schema Mapping</CardTitle>
+                <CardDescription>Map your file's columns to the required statistical fields.</CardDescription>
+            </CardHeader>
+            <CardContent>
+                <div className="space-y-4">
+                    {targetFields.map(field => (
+                        <div key={field} className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                            <TooltipWrapper text={`Map the column representing the ${field}.`}>
+                                <Label htmlFor={field} className="font-semibold">{field}</Label>
+                            </TooltipWrapper>
+                            <Select
+                                id={field}
+                                value={schemaMapping[field] || ''}
+                                onChange={(e) => handleMappingChange(field, e.target.value)}
+                            >
+                                <option value="" disabled>Select a column</option>
+                                {columns.map(col => (
+                                    <option key={col} value={col}>{col}</option>
+                                ))}
+                            </Select>
+                        </div>
+                    ))}
+                </div>
+            </CardContent>
+        </Card>
+    );
+};
+
+const Step3_Cleaning = ({ columns, cleaningConfig, setCleaningConfig }) => {
+    const handleConfigChange = (key, value) => {
+        setCleaningConfig(prev => ({ ...prev, [key]: value }));
+    };
+    
+    const numericColumns = columns; // Simplified, ideally filter for numeric
+
+    return (
+        <Card>
+            <CardHeader>
+                <CardTitle>Step 3: Data Cleaning & Validation</CardTitle>
+                <CardDescription>Configure operations to clean and validate your data.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+                <div>
+                    <h4 className="font-semibold text-lg mb-2">Missing Value Imputation</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                        <TooltipWrapper text="Select the column to apply imputation.">
+                            <Label htmlFor="impute-col">Column</Label>
+                        </TooltipWrapper>
+                        <Select id="impute-col" value={cleaningConfig.imputation.column} onChange={e => handleConfigChange('imputation', {...cleaningConfig.imputation, column: e.target.value})}>
+                            <option value="">None</option>
+                             {numericColumns.map(col => <option key={col} value={col}>{col}</option>)}
+                        </Select>
+                        <TooltipWrapper text="Choose the method to fill missing values.">
+                            <Label htmlFor="impute-method">Method</Label>
+                        </TooltipWrapper>
+                        <Select id="impute-method" value={cleaningConfig.imputation.method} onChange={e => handleConfigChange('imputation', {...cleaningConfig.imputation, method: e.target.value})} disabled={!cleaningConfig.imputation.column}>
+                            <option value="none">None</option>
+                            <option value="mean">Mean</option>
+                            <option value="median">Median</option>
+                            <option value="knn">KNN (Not implemented)</option>
+                        </Select>
+                    </div>
+                </div>
+                <div>
+                    <h4 className="font-semibold text-lg mb-2">Outlier Detection</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                       <TooltipWrapper text="Select the column to check for outliers.">
+                            <Label htmlFor="outlier-col">Column</Label>
+                        </TooltipWrapper>
+                        <Select id="outlier-col" value={cleaningConfig.outlier.column} onChange={e => handleConfigChange('outlier', {...cleaningConfig.outlier, column: e.target.value})}>
+                            <option value="">None</option>
+                             {numericColumns.map(col => <option key={col} value={col}>{col}</option>)}
+                        </Select>
+                        <TooltipWrapper text="IQR is robust to outliers, Z-score assumes normal distribution.">
+                            <Label htmlFor="outlier-method">Method</Label>
+                        </TooltipWrapper>
+                        <Select id="outlier-method" value={cleaningConfig.outlier.method} onChange={e => handleConfigChange('outlier', {...cleaningConfig.outlier, method: e.target.value})} disabled={!cleaningConfig.outlier.column}>
+                            <option value="none">None</option>
+                            <option value="iqr">IQR</option>
+                            <option value="z-score">Z-score</option>
+                        </Select>
+                    </div>
+                </div>
+                 <div>
+                    <h4 className="font-semibold text-lg mb-2">Rule-based Validation</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                        <TooltipWrapper text="e.g., age > 18">
+                            <Label htmlFor="validation-rule">Rule (e.g., column > value)</Label>
+                        </TooltipWrapper>
+                        <Input id="validation-rule" placeholder="e.g. age > 18" value={cleaningConfig.validationRule} onChange={e => handleConfigChange('validationRule', e.target.value)} />
+                    </div>
+                </div>
+            </CardContent>
+        </Card>
+    );
+};
+
+const Step4_Estimation = ({ processedData, schemaMapping, setResults }) => {
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleRunEstimation = () => {
+        setIsLoading(true);
+        setError(null);
+        
+        // Simulate async processing
+        setTimeout(() => {
+            try {
+                const { weight, analysisVar1, analysisVar2 } = schemaMapping;
+                if (!analysisVar1) {
+                    throw new Error("Analysis Variable 1 is not mapped.");
+                }
+                 if (!weight) {
+                    throw new Error("Weight column is not mapped.");
+                }
+
+                const results1 = dataProcessor.calculateEstimates(processedData, analysisVar1, weight);
+                let results2 = null;
+                if (analysisVar2) {
+                    results2 = dataProcessor.calculateEstimates(processedData, analysisVar2, weight);
+                }
+                
+                setResults({
+                    var1: { name: analysisVar1, ...results1 },
+                    var2: analysisVar2 ? { name: analysisVar2, ...results2 } : null,
+                });
+
+            } catch (e) {
+                setError(e.message);
+                console.error("Estimation Error:", e);
+            } finally {
+                setIsLoading(false);
+            }
+        }, 500);
+    };
+    
+    return (
+        <Card>
+            <CardHeader>
+                <CardTitle>Step 4: Estimation</CardTitle>
+                <CardDescription>Run the estimation process to compute statistics.</CardDescription>
+            </CardHeader>
+            <CardContent className="text-center">
+                <p className="mb-4">All configurations are set. Click the button below to process the data and generate estimates.</p>
+                <Button onClick={handleRunEstimation} disabled={isLoading}>
+                    {isLoading ? 'Calculating...' : 'Run Estimation'}
+                </Button>
+                {error && <p className="text-red-500 mt-4"><AlertCircle className="inline-block mr-2" />{error}</p>}
+            </CardContent>
+        </Card>
+    );
+};
+
+
+const Step5_Report = ({ results, logs, fileName, schemaMapping, cleaningConfig }) => {
+    const reportRef = React.useRef();
+
+    const handleDownloadPdf = () => {
+        const input = reportRef.current;
+        html2canvas(input, { scale: 2 }).then(canvas => {
+            const imgData = canvas.toDataURL('image/png');
+            const pdf = new jsPDF('p', 'mm', 'a4');
+            const pdfWidth = pdf.internal.pageSize.getWidth();
+            const pdfHeight = pdf.internal.pageSize.getHeight();
+            const canvasWidth = canvas.width;
+            const canvasHeight = canvas.height;
+            const ratio = canvasWidth / canvasHeight;
+            const height = pdfWidth / ratio;
+            
+            let position = 0;
+            if (height < pdfHeight) {
+                pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, height);
+            } else { // Handle long content
+                 const pageHeight = pdf.internal.pageSize.height;
+                 let heightLeft = canvasHeight;
+                 while(heightLeft > 0) {
+                    pdf.addImage(imgData, 'PNG', 0, position, canvasWidth, canvasHeight, undefined, 'FAST');
+                    heightLeft -= pageHeight;
+                    position -= pageHeight;
+                    if(heightLeft > 0) {
+                        pdf.addPage();
+                    }
+                 }
+            }
+            pdf.save(`report-${fileName}.pdf`);
+        });
+    };
+
+    if (!results) {
+        return (
+            <Card>
+                <CardContent>
+                    <p>No results to display. Please complete the estimation step.</p>
+                </CardContent>
+            </Card>
+        );
+    }
+
+    const renderResultsTable = (data, title) => (
+        <div>
+            <h4 className="font-semibold text-lg mb-2">{title} ({data.name})</h4>
+            <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left text-gray-500">
+                    <thead className="text-xs text-gray-700 uppercase bg-gray-50">
+                        <tr>
+                            <th scope="col" className="px-6 py-3">Statistic</th>
+                            <th scope="col" className="px-6 py-3">Unweighted</th>
+                            <th scope="col" className="px-6 py-3">Weighted</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr className="bg-white border-b">
+                            <td className="px-6 py-4 font-medium">Count</td>
+                            <td className="px-6 py-4">{data.unweighted.count.toLocaleString()}</td>
+                            <td className="px-6 py-4">{data.weighted.count.toLocaleString()}</td>
+                        </tr>
+                        <tr className="bg-white border-b">
+                             <td className="px-6 py-4 font-medium">Mean</td>
+                            <td className="px-6 py-4">{data.unweighted.mean.toFixed(3)}</td>
+                            <td className="px-6 py-4">{data.weighted.mean.toFixed(3)}</td>
+                        </tr>
+                        <tr className="bg-white border-b">
+                             <td className="px-6 py-4 font-medium">Margin of Error (95%)</td>
+                            <td className="px-6 py-4">{data.unweighted.moe.toFixed(3)}</td>
+                            <td className="px-6 py-4">{data.weighted.moe.toFixed(3)}</td>
+                        </tr>
+                         <tr className="bg-white">
+                             <td className="px-6 py-4 font-medium">Total</td>
+                            <td className="px-6 py-4">{data.unweighted.total.toLocaleString(undefined, {maximumFractionDigits: 2})}</td>
+                            <td className="px-6 py-4">{data.weighted.total.toLocaleString(undefined, {maximumFractionDigits: 2})}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+    
+    const chartData = [
+        { name: 'Unweighted Mean', value: results.var1.unweighted.mean },
+        { name: 'Weighted Mean', value: results.var1.weighted.mean },
+    ];
+    if (results.var2) {
+        chartData.push({ name: `Unweighted Mean (${results.var2.name})`, value: results.var2.unweighted.mean });
+        chartData.push({ name: `Weighted Mean (${results.var2.name})`, value: results.var2.weighted.mean });
+    }
+
+    return (
+        <Card>
+            <CardHeader className="flex-row items-center justify-between">
+                <div>
+                    <CardTitle>Step 5: Report and Visualization</CardTitle>
+                    <CardDescription>Review the results and download the report.</CardDescription>
+                </div>
+                <Button onClick={handleDownloadPdf}><Download className="mr-2 h-4 w-4" /> Download PDF</Button>
+            </CardHeader>
+            <CardContent ref={reportRef} className="bg-white p-8">
+                <div className="space-y-8">
+                    <div className="text-center">
+                        <h2 className="text-3xl font-bold">Survey Analysis Report</h2>
+                        <p className="text-gray-500">Generated on: {new Date().toLocaleDateString()}</p>
+                    </div>
+
+                    <div className="page-break-after">
+                        <h3 className="text-xl font-semibold border-b pb-2 mb-4">Summary</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {renderResultsTable(results.var1, "Primary Analysis Variable")}
+                            {results.var2 && renderResultsTable(results.var2, "Secondary Analysis Variable")}
+                        </div>
+                    </div>
+                    
+                    <div className="page-break-after">
+                        <h3 className="text-xl font-semibold border-b pb-2 mb-4">Visualizations</h3>
+                        <ResponsiveContainer width="100%" height={400}>
+                            <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
+                                <CartesianGrid strokeDasharray="3 3" />
+                                <XAxis dataKey="name" />
+                                <YAxis />
+                                <Tooltip />
+                                <Legend />
+                                <Bar dataKey="value" fill="#3b82f6" />
+                            </BarChart>
+                        </ResponsiveContainer>
+                    </div>
+
+                    <div>
+                        <h3 className="text-xl font-semibold border-b pb-2 mb-4">Workflow Log & Diagnostics</h3>
+                        <div className="bg-gray-50 p-4 rounded-lg text-sm space-y-2">
+                             <p><strong>Input File:</strong> {fileName}</p>
+                             <p><strong>Schema Mapping:</strong></p>
+                             <ul className="list-disc list-inside pl-4">
+                                {Object.entries(schemaMapping).map(([key, value]) => value && <li key={key}><strong>{key}:</strong> {value}</li>)}
+                             </ul>
+                             <p><strong>Cleaning Operations:</strong></p>
+                             <ul className="list-disc list-inside pl-4">
+                                <li>Imputation: {cleaningConfig.imputation.column ? `${cleaningConfig.imputation.method} on ${cleaningConfig.imputation.column}` : 'None'}</li>
+                                <li>Outlier Detection: {cleaningConfig.outlier.column ? `${cleaningConfig.outlier.method} on ${cleaningConfig.outlier.column}` : 'None'}</li>
+                                <li>Validation Rule: {cleaningConfig.validationRule || 'None'}</li>
+                             </ul>
+                             <p><strong>Processing Logs:</strong></p>
+                             <pre className="bg-gray-800 text-white p-3 rounded-md overflow-x-auto text-xs">
+                                {logs.join('\n')}
+                             </pre>
+                        </div>
+                    </div>
+                </div>
+            </CardContent>
+        </Card>
+    );
+};
+
+
+// --- Main App Component ---
+
+export default function App() {
+    const [step, setStep] = useState(1);
+    const [fileName, setFileName] = useState('');
+    const [rawData, setRawData] = useState([]);
+    const [columns, setColumns] = useState([]);
+    const [schemaMapping, setSchemaMapping] = useState({});
+    const [cleaningConfig, setCleaningConfig] = useState({
+        imputation: { column: '', method: 'none' },
+        outlier: { column: '', method: 'none' },
+        validationRule: '',
+    });
+    const [processedData, setProcessedData] = useState(null);
+    const [results, setResults] = useState(null);
+    const [logs, setLogs] = useState([]);
+
+    const addLog = (message) => {
+        setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
+    };
+
+    const handleFileAccepted = (name, data, fields) => {
+        setFileName(name);
+        setRawData(data);
+        setColumns(fields);
+        setStep(2);
+        addLog(`File "${name}" uploaded with ${data.length} rows and ${fields.length} columns.`);
+    };
+    
+    const processDataForEstimation = () => {
+        addLog("Starting data processing...");
+        let currentData = [...rawData];
+
+        // Imputation
+        const { imputation } = cleaningConfig;
+        if (imputation.column && imputation.method !== 'none') {
+            currentData = dataProcessor.handleMissingValues(currentData, imputation.column, imputation.method);
+            addLog(`Applied ${imputation.method} imputation to column "${imputation.column}".`);
+        }
+
+        // Outlier Detection
+        const { outlier } = cleaningConfig;
+        if (outlier.column && outlier.method !== 'none') {
+            currentData = dataProcessor.detectOutliers(currentData, outlier.column, outlier.method);
+            const outlierCount = currentData.filter(r => r[`${outlier.column}_is_outlier`]).length;
+            addLog(`Applied ${outlier.method} outlier detection to "${outlier.column}". Found ${outlierCount} outliers.`);
+        }
+        
+        // Validation (simple filter for demo)
+        if (cleaningConfig.validationRule) {
+            try {
+                const [col, op, valStr] = cleaningConfig.validationRule.split(/([>|<|=]+)/).map(s => s.trim());
+                const val = parseFloat(valStr);
+                if (col && op && !isNaN(val)) {
+                    const originalCount = currentData.length;
+                    currentData = currentData.filter(row => {
+                       const rowVal = parseFloat(row[col]);
+                       if (isNaN(rowVal)) return true; // keep rows that can't be evaluated
+                       if (op === '>') return rowVal > val;
+                       if (op === '<') return rowVal < val;
+                       if (op === '=') return rowVal === val;
+                       return true;
+                    });
+                    addLog(`Applied validation rule "${cleaningConfig.validationRule}". ${originalCount - currentData.length} rows removed.`);
+                }
+            } catch (e) {
+                addLog(`Could not apply validation rule: ${e.message}`);
+            }
+        }
+
+        setProcessedData(currentData);
+        addLog("Data processing complete.");
+        return currentData;
+    };
+
+    const nextStep = () => {
+        if (step === 3) {
+            const processed = processDataForEstimation();
+            setProcessedData(processed);
+        }
+        if (step === 4 && !results) {
+            // This is handled inside Step 4 component now
+            return;
+        }
+        setStep(s => Math.min(s + 1, 5));
+    };
+    const prevStep = () => setStep(s => Math.max(s - 1, 1));
+
+    const steps = [
+        { name: 'Upload', icon: FileText },
+        { name: 'Map Schema', icon: Settings },
+        { name: 'Clean Data', icon: Settings },
+        { name: 'Estimate', icon: BarChart2 },
+        { name: 'Report', icon: Download },
+    ];
+    
+    const isNextDisabled = () => {
+        if (step === 2) {
+            return !schemaMapping.uniqueId || !schemaMapping.weight || !schemaMapping.analysisVar1;
+        }
+        return false;
+    }
+
+    return (
+        <div className="bg-gray-50 min-h-screen font-sans p-4 sm:p-6 lg:p-8">
+            <div className="max-w-6xl mx-auto">
+                <header className="text-center mb-8">
+                    <h1 className="text-4xl font-bold text-gray-800">AI-Enhanced Survey Data Processor</h1>
+                    <p className="text-lg text-gray-600 mt-2">Automate survey data preparation, estimation, and reporting.</p>
+                </header>
+
+                {/* Progress Bar */}
+                <div className="mb-8">
+                    <div className="flex justify-between items-center">
+                        {steps.map((s, index) => (
+                            <React.Fragment key={s.name}>
+                                <div className="flex flex-col items-center text-center">
+                                    <div className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 ${index + 1 <= step ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-500'}`}>
+                                        {index + 1 < step ? <CheckCircle /> : <s.icon />}
+                                    </div>
+                                    <p className={`mt-2 font-semibold ${index + 1 <= step ? 'text-blue-600' : 'text-gray-500'}`}>{s.name}</p>
+                                </div>
+                                {index < steps.length - 1 && <div className={`flex-1 h-1 mx-2 transition-all duration-300 ${index + 1 < step ? 'bg-blue-600' : 'bg-gray-200'}`}></div>}
+                            </React.Fragment>
+                        ))}
+                    </div>
+                </div>
+
+                <main>
+                    {step === 1 && <Step1_Upload onFileAccepted={handleFileAccepted} />}
+                    {step === 2 && <Step2_SchemaMapping columns={columns} schemaMapping={schemaMapping} setSchemaMapping={setSchemaMapping} />}
+                    {step === 3 && <Step3_Cleaning columns={columns} cleaningConfig={cleaningConfig} setCleaningConfig={setCleaningConfig} />}
+                    {step === 4 && <Step4_Estimation processedData={processedData} schemaMapping={schemaMapping} setResults={setResults} />}
+                    {step === 5 && <Step5_Report results={results} logs={logs} fileName={fileName} schemaMapping={schemaMapping} cleaningConfig={cleaningConfig} />}
+                </main>
+
+                <footer className="mt-8 flex justify-between items-center">
+                    <Button onClick={prevStep} disabled={step === 1} variant="secondary">
+                        <ArrowLeft className="mr-2 h-4 w-4" /> Previous
+                    </Button>
+                    {step < 5 ? (
+                         <Button onClick={nextStep} disabled={isNextDisabled()}>
+                            Next <ArrowRight className="ml-2 h-4 w-4" />
+                        </Button>
+                    ) : (
+                        <Button onClick={() => window.location.reload()}>
+                            Start New Analysis
+                        </Button>
+                    )}
+                </footer>
+            </div>
+        </div>
+    );
+}
